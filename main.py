@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Forecast Polymarket Yes prices 240 minutes ahead, five quantiles per minute.
 
-Method (v3): a random-walk forecast around each market's checkpoint price,
+Method (v4): a random-walk forecast around each market's checkpoint price,
 with the spread fitted to the market's own recent volatility and the median
-pulled toward the event's own recent probability-mass level.
+pulled toward the event's own recent probability-mass level -- plus a
+downward median shift for the event's larger markets, whose future prices
+are right-skewed (bounded below by 0, occasional jumps up), so their
+conditional median sits below the checkpoint price.
 
 * Median: the checkpoint price, plus a drift that pulls the whole event's
   prices back toward the level their sum sat at over the last 12 hours.
@@ -19,14 +22,30 @@ pulled toward the event's own recent probability-mass level.
   because a market's first minutes trade near 0.5 before finding its
   level, which spikes the sum briefly; the median ignores those spikes.
   Strength 0.8, time constant 60 minutes.
+* Leader-decay shift (new in v4): the median is pulled down by
+  0.5 * w * sigma * grow(h), where sigma is the market's own per-minute
+  volatility and grow(h) the spread's horizon growth below. The weight w
+  ramps from 0 at half the field-average price (sum / number of markets)
+  to 1 at the field average: w = clip((x - 0.5*fa) / (0.5*fa), 0, 1).
+  The weight is relative to the event's own field average, so it is
+  scale-free: it fires for the larger markets of any family, whether its
+  prices sum to ~1 or ~0.1. A hard absolute threshold (e.g. price > 0.05)
+  scored a touch better on the practice (0.2722 vs 0.2746) but would
+  switch the shift off entirely for the FAA family, whose prices sit
+  below 0.05 -- so the scale-free ramp is used instead.
 * Spread: each market's own per-minute volatility, the LARGER of a fast
   (half-life 30 minutes) and a slow (half-life 2 hours) exponentially
   weighted variance of its one-minute price changes (last 24 hours,
   winsorised at +-0.05), scaled by 0.3 and floored at 0.0002. Volatility
   clusters: it jumps up fast after a burst and decays slowly, so the
-  spread should rise fast and fall slow. The spread grows like sqrt(h)
-  for minute h, with the 5%/95% quantiles widened a further 1.3x because
-  the moves are heavy-tailed (quantiles of the standard normal).
+  spread should rise fast and fall slow. The spread grows like
+  sqrt(240 * (1 - exp(-h/240))) for minute h -- saturating, not sqrt(h):
+  prices mean-revert inside the event (mass swaps between markets rather
+  than wandering away), so long-horizon spread grows slower than a random
+  walk's. The 95% quantile is widened a further 1.8x and the 5% quantile
+  is not widened at all: the moves are heavy-tailed upward only (the
+  lower tail is cut off by the 0 boundary), quantiles of the standard
+  normal otherwise.
 * No drift from a market's own recent trend: one-minute moves show no
   usable autocorrelation, and pulling the median toward a trailing mean
   made the practice score worse (old deviations are regime shifts, not
@@ -36,17 +55,13 @@ Quantiles are clamped to [0, 1], rounded to 6 decimals and forced
 non-decreasing. Standard library only, no network, deterministic.
 
 Practice loss (local scoring, pinball loss in percentage points):
-p00-p04, scored against the next case's prices -- old entry 0.318224
-pooled, new entry 0.286033 pooled (per-case 0.3534 / 0.3084 / 0.3314 /
-0.2670 / 0.1974, mean 0.2915), versus the old entry's 0.5059 / 0.3092 /
-0.3865 / 0.2366 / 0.2010 (mean 0.3278). The house baseline scores
-0.363589 pooled over all six practice cases. Case p05 has no later case
-to score it against locally, so it is not in the local numbers above;
-the new entry's p05 drift is near zero (its sum sits almost exactly on
-its recent level), and on a frozen-price approximation of p05 it ties
-the old entry, so the six-case total is expected to improve by about
-the same margin. The practice is a different event, so this is a guide
-only, not a promise about the final.
+p00-p04, scored against the next case's prices -- v3 0.286033 pooled
+(per-case 0.3534 / 0.3084 / 0.3314 / 0.2670 / 0.1974), v4 0.274599
+pooled (per-case 0.3120 / 0.3013 / 0.3201 / 0.2770 / 0.1855, mean
+0.2792), versus the house baseline 0.363589 pooled over all six
+practice cases. Case p05 has no later case to score it against locally,
+so it is not in the local numbers above. The practice is a different
+event, so this is a guide only, not a promise about the final.
 """
 import json
 import math
@@ -73,13 +88,23 @@ SIGMA_MULT = 0.3
 # No market is ever forecast as perfectly still.
 SIGMA_FLOOR = 0.0002
 # Extra widening of the outer (5% / 95%) quantiles: heavy-tailed moves.
-TAIL_MULT = 1.3
+# v4: asymmetric -- the upper tail is longer than the lower one (the 0
+# boundary cuts the lower tail off), so only the 95% quantile is widened.
+TAIL_MULT_LO = 1.0
+TAIL_MULT_HI = 1.8
 # Fraction of the sum's excess over its recent level removed over the horizon.
 SUM_REVERT = 0.8
 # Time constant, in minutes, of the sum reversion.
 SUM_TAU_MIN = 60.0
 # The sum's recent level is the median of its last that many minutes.
 SUM_TARGET_WINDOW_MIN = 720
+# Time constant, in minutes, of the saturating spread growth:
+# spread(h) ~ sqrt(TAU * (1 - exp(-h/TAU))).
+SPREAD_SAT_TAU_MIN = 240.0
+# Leader-decay shift: the median of a larger market is pulled down by
+# SHIFT_COEF * w * sigma * grow(h); w ramps from 0 at half the
+# field-average price to 1 at the field average (see forecast_case).
+SHIFT_COEF = 0.5
 
 
 def parse_ts(s):
@@ -167,7 +192,11 @@ def forecast_case(case):
         total += m["prices"][-1] if m["prices"] else 0.0
     target = sum_target(case)
     excess = (total - target) if target is not None else 0.0
-    sqrt_h = [math.sqrt(h + 1) for h in range(horizon)]
+    n_markets = len(markets)
+    field_avg = total / n_markets if n_markets else 0.0
+    grow_h = [math.sqrt(SPREAD_SAT_TAU_MIN *
+                        (1.0 - math.exp(-(h + 1) / SPREAD_SAT_TAU_MIN)))
+              for h in range(horizon)]
     revert_h = [1.0 - math.exp(-(h + 1) / SUM_TAU_MIN) for h in range(horizon)]
     forecasts = []
     for m in markets:
@@ -179,13 +208,23 @@ def forecast_case(case):
         sigma = market_sigma(prices)
         share = x / total if total > 0.0 else 0.0
         drift_total = -SUM_REVERT * excess * share
+        # Leader-decay weight: 0 below half the field average, 1 at or
+        # above the field average, linear in between. Scale-free: it is
+        # relative to the event's own field average, not an absolute price.
+        if field_avg > 0.0:
+            w = (x - 0.5 * field_avg) / (0.5 * field_avg)
+            w = 0.0 if w < 0.0 else (1.0 if w > 1.0 else w)
+        else:
+            w = 0.0
+        shift = -SHIFT_COEF * w * sigma
         rows = []
         for h in range(horizon):
-            med = x + drift_total * revert_h[h]
-            spread = sigma * sqrt_h[h]
+            med = x + drift_total * revert_h[h] + shift * grow_h[h]
+            spread = sigma * grow_h[h]
             row = []
             for j, z in enumerate(Z):
-                zz = z * TAIL_MULT if j == 0 or j == 4 else z
+                zz = z * (TAIL_MULT_LO if j == 0 else
+                          TAIL_MULT_HI if j == 4 else 1.0)
                 row.append(price6(med + zz * spread))
             for j in range(1, 5):
                 if row[j] < row[j - 1]:
